@@ -265,7 +265,7 @@ func iptracker(incoming chan string, getbest chan getbestrequest) {
 			for ip, res := range ips {
 				fmt.Printf("Resultlog %s : %v : %s : %s\n", ip, res.status, res.timing, res.lastchecked)
 			}
-		case <-time.After(time.Second):
+		case <-time.After(time.Second * 2):
 			//Pingtest the oldest ip
 			oldest := ""
 			oldesttime := time.Now()
