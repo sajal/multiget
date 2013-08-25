@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/miekg/dns"
 	"io/ioutil"
+	"log"
+	"net"
+	"os"
 	"runtime"
 	"strconv"
 	"time"
@@ -22,6 +26,78 @@ type config struct {
 }
 
 var servers []string //Global variable for list of dns servers
+
+const (
+	ICMP_ECHO_REQUEST = 8
+	ICMP_ECHO_REPLY   = 0
+)
+
+// returns a suitable 'ping request' packet, with id & seq and a
+// payload length of pktlen
+func makePingRequest(id, seq, pktlen int, filler []byte) []byte {
+	p := make([]byte, pktlen)
+	copy(p[8:], bytes.Repeat(filler, (pktlen-8)/len(filler)+1))
+
+	p[0] = ICMP_ECHO_REQUEST // type
+	p[1] = 0                 // code
+	p[2] = 0                 // cksum
+	p[3] = 0                 // cksum
+	p[4] = uint8(id >> 8)    // id
+	p[5] = uint8(id & 0xff)  // id
+	p[6] = uint8(seq >> 8)   // sequence
+	p[7] = uint8(seq & 0xff) // sequence
+
+	// calculate icmp checksum
+	cklen := len(p)
+	s := uint32(0)
+	for i := 0; i < (cklen - 1); i += 2 {
+		s += uint32(p[i+1])<<8 | uint32(p[i])
+	}
+	if cklen&1 == 1 {
+		s += uint32(p[cklen-1])
+	}
+	s = (s >> 16) + (s & 0xffff)
+	s = s + (s >> 16)
+
+	// place checksum back in header; using ^= avoids the
+	// assumption the checksum bytes are zero
+	p[2] ^= uint8(^s & 0xff)
+	p[3] ^= uint8(^s >> 8)
+
+	return p
+}
+
+func singleping(ip string) (time.Duration, error) {
+	addr := net.IPAddr{IP: net.ParseIP(ip)}
+	sendid := os.Getpid() & 0xffff
+	sendseq := 1
+	pingpktlen := 64
+	sendpkt := makePingRequest(sendid, sendseq, pingpktlen, []byte("Go Ping"))
+	ipconn, err := net.DialIP("ip4:icmp", nil, &addr) // *IPConn (Conn 인터페이스 구현)
+	if err != nil {
+		log.Fatalf(`net.DialIP("ip4:icmp", %v) = %v`, ipconn, err)
+	}
+	ipconn.SetDeadline(time.Now().Add(time.Second)) //1 Second timeout
+	start := time.Now()
+	n, err := ipconn.WriteToIP(sendpkt, &addr)
+	if err != nil || n != pingpktlen {
+		log.Fatalf(`net.WriteToIP(..., %v) = %v, %v`, addr, n, err)
+	}
+
+	resp := make([]byte, 1024)
+	_, _, pingerr := ipconn.ReadFrom(resp)
+	/*
+		if pingerr != nil {
+			fmt.Printf("%s : FAIL\n", ip)
+		} else {
+			fmt.Printf("%s : %s\n", ip, time.Since(start))
+		}
+	*/
+	// log.Printf("%x", resp)
+
+	return time.Since(start), pingerr
+}
+
 /*
 type dnsrequest struct {
 	query   dnsresponse
@@ -77,6 +153,7 @@ func multidns(query *dns.Msg, out chan *dns.Msg) {
 
 	var logline string
 	sent := false
+	var allresults []*dns.Msg
 	for i := 0; i < len(servers); i++ {
 		result := <-response
 		if !sent && result.response != nil {
@@ -90,6 +167,18 @@ func multidns(query *dns.Msg, out chan *dns.Msg) {
 			//... but log everyone
 			logline += fmt.Sprintf("%s (%s) ; ", result.server, time.Since(start))
 		}
+		//extract ips from result.response
+		if result.response != nil {
+			if iscachable(result.response) {
+				for _, ans := range result.response.Answer {
+					if ans.Header().Rrtype == dns.TypeA {
+						//fmt.Printf("%s\n", ans.(*dns.A).A)
+						ipchan <- fmt.Sprintf("%s", ans.(*dns.A).A)
+					}
+				}
+				allresults = append(allresults, result.response)
+			}
+		}
 	}
 	//logline += "\n"
 	var name []string
@@ -97,6 +186,9 @@ func multidns(query *dns.Msg, out chan *dns.Msg) {
 		name = append(name, q.Name+":"+dns.Class(q.Qclass).String())
 	}
 	fmt.Printf("%s (%s): %s\n", start, name, logline)
+	if len(allresults) > 0 {
+		putincache(allresults)
+	}
 	//fmt.Printf("Exiting...\n")
 }
 
@@ -106,6 +198,92 @@ type cacheobj struct {
 }
 
 //var cache map[dns.Question]cacheobj
+
+var ipchan chan string
+
+type ipresult struct {
+	timing      time.Duration
+	status      bool
+	lastchecked time.Time
+}
+
+type updateres struct {
+	ip     string
+	result ipresult
+}
+
+func pingtest(ip string, cb chan updateres) {
+	timing, err := singleping(ip)
+	if err != nil {
+		cb <- updateres{ip: ip, result: ipresult{status: false, lastchecked: time.Now()}}
+	} else {
+		cb <- updateres{ip: ip, result: ipresult{status: true, timing: timing, lastchecked: time.Now()}}
+	}
+
+}
+
+type getbestrequest struct {
+	candidates []string    //List of possible ips
+	channel    chan string //The best ip. Blank if none.
+}
+
+var getbest chan getbestrequest
+
+func iptracker(incoming chan string, getbest chan getbestrequest) {
+	ips := make(map[string]ipresult)
+	resultupdate := make(chan updateres, 100)
+	for {
+		select {
+		case ip := <-incoming:
+			//fmt.Println(ip)
+			_, exists := ips[ip]
+			if !exists {
+				//Start non-blocking test
+				go pingtest(ip, resultupdate)
+				//fmt.Printf("Length %d\n", len(ips))
+			}
+		case result := <-resultupdate:
+			//All writes serialized
+			ips[result.ip] = result.result
+		case bestreq := <-getbest:
+			best := ""
+			besttime := time.Minute
+			for _, candidate := range bestreq.candidates {
+				result, exists := ips[candidate]
+				if exists {
+					if result.status {
+						if besttime > result.timing {
+							besttime = result.timing
+							best = candidate
+						}
+					}
+				}
+			}
+			bestreq.channel <- best
+		case <-time.After(time.Second * 10):
+			//Dump onscreen every 10 secs
+			for ip, res := range ips {
+				fmt.Printf("Resultlog %s : %v : %s : %s\n", ip, res.status, res.timing, res.lastchecked)
+			}
+		case <-time.After(time.Second):
+			//Pingtest the oldest ip
+			oldest := ""
+			oldesttime := time.Now()
+			for ip, res := range ips {
+				//fmt.Printf("Resultlog %s : %v : %s : %s\n", ip, res.status, res.timing, res.lastchecked)
+				if res.lastchecked.Before(oldesttime) {
+					oldest = ip
+					oldesttime = res.lastchecked
+				}
+			}
+			if oldest != "" {
+				fmt.Printf("Recheck: %s\n", oldest)
+				//				fmt.Printf("Resultlog %s : %v : %s : %s\n", ip, res.status, res.timing, res.lastchecked)
+				go pingtest(oldest, resultupdate)
+			}
+		}
+	}
+}
 
 func iscachable(r *dns.Msg) bool {
 	if len(r.Question) == 1 {
@@ -119,8 +297,8 @@ func iscachable(r *dns.Msg) bool {
 }
 
 type cacherequest struct {
-	msg *dns.Msg
-	channel  chan []dns.RR
+	msg     *dns.Msg
+	channel chan []dns.RR
 }
 
 type putrequest struct {
@@ -139,9 +317,30 @@ func cacheservice(req chan cacherequest, putter chan putrequest) {
 		case request := <-req:
 			obj, exists := cache[request.msg.Question[0]]
 			if exists {
-				request.channel <- obj.ans
+				var allips []string
+				var best string
+				for _, a := range obj.ans {
+					allips = append(allips, fmt.Sprintf("%s", a.(*dns.A).A))
+				}
+				//fmt.Printf("%s\n", allips)
+				if len(allips) > 0 {
+					c := make(chan string, 1)
+					getbest <- getbestrequest{candidates: allips, channel: c}
+					best = <- c
+					fmt.Printf("Best: %s\n", best)
+				}
+				if best != "" {
+					//we actually have a winner
+					line := fmt.Sprintf("%s %d IN A %s", request.msg.Question[0].Name, 60, best)
+					rr, _ := dns.NewRR(line)
+					request.channel <- []dns.RR{rr}
+				} else {
+					//Somehow we dont have a "best" answer
+					request.channel <- obj.ans
+				}
 				//Check if stale
-				if obj.expire.Before(time.Now()){
+				if obj.expire.Before(time.Now()) {
+					//If a stale object was served, make fresh response.
 					fmt.Printf("Stale\n")
 					go runquery(request.msg, true)
 				}
@@ -149,34 +348,41 @@ func cacheservice(req chan cacherequest, putter chan putrequest) {
 				request.channel <- nil
 			}
 		case put := <-putter:
+			fmt.Printf("Inserting %s : %d\n", put.question, len(put.result))
 			cache[put.question] = cacheobj{ans: put.result, expire: time.Now().Add(time.Duration(put.ttl) * time.Second)}
 		}
 	}
 
 }
 
-func putincache(r *dns.Msg) {
-	if iscachable(r) {
-		//fmt.Printf("%s\n", r.Answer)
-		var minttl uint32
-		var newans []dns.RR
-		for _, ans := range r.Answer {
-			//fmt.Printf("%s\n", ans.Header().Ttl)
-			if minttl == 0 || minttl > ans.Header().Ttl {
-				minttl = ans.Header().Ttl
+func putincache(results []*dns.Msg) {
+	var newans []dns.RR
+	var minttl uint32
+	var question dns.Question
+	for _, r := range results {
+		if iscachable(r) {
+			//fmt.Printf("%s\n", r.Answer)
+			question = r.Question[0]
+			for _, ans := range r.Answer {
+				//fmt.Printf("%s\n", ans.Header().Ttl)
+				if minttl == 0 || minttl > ans.Header().Ttl {
+					minttl = ans.Header().Ttl
+				}
+				if ans.Header().Rrtype == dns.TypeA {
+					line := fmt.Sprintf("%s %d IN A %s", r.Question[0].Name, minttl, ans.(*dns.A).A)
+					rr, _ := dns.NewRR(line)
+					//fmt.Println(rr)
+					newans = append(newans, rr)
+				}
 			}
-			if ans.Header().Rrtype == dns.TypeA {
-				line := fmt.Sprintf("%s %d IN A %s", r.Question[0].Name, minttl, ans.(*dns.A).A )
-				rr, _ := dns.NewRR( line )
-				//fmt.Println(rr)
-				newans = append(newans, rr)
-
-			}
+			//Cache forever for now.
+			//cache[r.Question[0]] = cacheobj{ans: r.Answer, expire: time.Now()}
+			//fmt.Printf("Cachable for %d\n", minttl)
 		}
-		cacheput <- putrequest{question: r.Question[0], ttl: minttl, result: newans}
-		//Cache forever for now.
-		//cache[r.Question[0]] = cacheobj{ans: r.Answer, expire: time.Now()}
-		//fmt.Printf("Cachable for %d\n", minttl)
+	}
+	fmt.Printf("Putting %d\n", len(newans))
+	if len(newans) > 0 {
+		cacheput <- putrequest{question: question, ttl: minttl, result: newans}
 	}
 }
 
@@ -184,7 +390,7 @@ func runquery(r *dns.Msg, forcemiss bool) *dns.Msg {
 	c := make(chan *dns.Msg, 1)
 	//Send out query unmolested
 
-	if iscachable(r) && !forcemiss{
+	if iscachable(r) && !forcemiss {
 		resp := make(chan []dns.RR, 1)
 		cachereq <- cacherequest{channel: resp, msg: r}
 		ans := <-resp
@@ -198,7 +404,7 @@ func runquery(r *dns.Msg, forcemiss bool) *dns.Msg {
 
 	go multidns(r, c)
 	in := <-c
-	go putincache(in)
+	//go putincache(in)
 	//Write first response unmolested
 	return in
 
@@ -214,6 +420,9 @@ func main() {
 	fmt.Printf("Launching %v procs\n", numCPU)
 	runtime.GOMAXPROCS(numCPU)
 	var conffile string
+	ipchan = make(chan string, 100)
+	getbest = make(chan getbestrequest, 100)
+	go iptracker(ipchan, getbest)
 	cachereq = make(chan cacherequest, 100)
 	cacheput = make(chan putrequest, 100)
 	go cacheservice(cachereq, cacheput)
