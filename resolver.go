@@ -326,7 +326,7 @@ func cacheservice(req chan cacherequest, putter chan putrequest) {
 				if len(allips) > 0 {
 					c := make(chan string, 1)
 					getbest <- getbestrequest{candidates: allips, channel: c}
-					best = <- c
+					best = <-c
 					fmt.Printf("Best: %s\n", best)
 				}
 				if best != "" {
@@ -348,8 +348,21 @@ func cacheservice(req chan cacherequest, putter chan putrequest) {
 				request.channel <- nil
 			}
 		case put := <-putter:
-			fmt.Printf("Inserting %s : %d\n", put.question, len(put.result))
-			cache[put.question] = cacheobj{ans: put.result, expire: time.Now().Add(time.Duration(put.ttl) * time.Second)}
+			//toinsert := false
+			var results []dns.RR
+			for _, ans := range put.result {
+				if ans.Header().Rrtype == dns.TypeA {
+					//fmt.Printf("%s\n", ans.(*dns.A).A)
+					//ipchan <- fmt.Sprintf("%s", ans.(*dns.A).A)
+					results = append(results, ans)
+				}
+			}
+			if len(results) > 0 {
+				//Only save the A records if available
+				fmt.Printf("Inserting %s : %d\n", put.question, len(results))
+				//fmt.Printf("%v\n", put.result)
+				cache[put.question] = cacheobj{ans: results, expire: time.Now().Add(time.Duration(put.ttl) * time.Second)}
+			}
 		}
 	}
 
